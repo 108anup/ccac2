@@ -1,4 +1,4 @@
-from typing import buf_size
+from typing import Optional
 
 class Config:
     C: float = 1
@@ -9,6 +9,8 @@ class Config:
     compose: bool = True
     inf_buf: bool = True
     buf_size: Optional[float] = 1
+
+    unsat_core: bool = False
 
     def check(self) -> bool:
         ''' Sanity check. Should assert this after setting all configs '''
