@@ -1,6 +1,6 @@
 from config import Config
 from pyz3_utils import MySolver, Variables
-from z3 import Implies, Or, Sum
+from z3 import And, Implies, Or, Sum
 
 
 class Flow(Variables):
@@ -12,6 +12,7 @@ class Flow(Variables):
         self.S = s.Real(f"{name}_S")
         self.L = s.Real(f"{name}_L")
         self.Ld = s.Real(f"{name}_Ld")
+        self.rtt = s.Real(f"{name}_rtt")
 
 
 class Timestep(Variables):
@@ -62,6 +63,7 @@ class ModelVariables(Variables):
         self.monotone()
         self.initial()
         self.network()
+        self.measure_losses_and_rtt()
 
     def monotone(self):
         c = self.c
@@ -110,7 +112,7 @@ class ModelVariables(Variables):
             s.add(init.Ld >= 0)
 
     def network(self):
-        # Invariants that apply independently on each timestep
+        ''' The heart of the CCAC model '''
         c = self.c
         s = self.s
         times = self.times
@@ -147,6 +149,8 @@ class ModelVariables(Variables):
                                   ts.A - ts.L <= ts.S + self.epsilon))
 
             if not c.inf_buf:
+                s.add(ts.A - ts.L <= c.C * ts.time - ts.W + self.buf)
+
                 if t == 0:
                     continue
                 # We can make loss deterministic since we assume all curves are
@@ -156,10 +160,63 @@ class ModelVariables(Variables):
                 # as it fits within c.T points)
 
                 s.add(Implies(ts.L > times[t-1].L,
-                              ts.A[t] - ts.L[t] ==
-                              c.C * ts.time - ts.W + c.buf))
+                              ts.A - ts.L ==
+                              c.C * ts.time - ts.W + self.buf))
             else:
                 s.add(ts.L == times[0].L)
+
+    def measure_losses_and_rtt(self):
+        '''Constrain Ld based on A, S and L. If these constraints are added, it will
+        automatically calculate delay since for every t, it will force t' such
+        that A[t'] - L[t'] = S[t] if S[t] >= A[0]
+
+        '''
+        c = self.c
+        s = self.s
+        times = self.times
+
+        for f in range(c.F):
+            s.add(times[0].flows[f].rtt > 0)
+
+        for t in range(0, c.T):
+            for f in range(c.F):
+                cur = times[t].flows[f]
+                zero = times[0].flows[f]
+
+                # For every S, ensure a corresponding A exists
+                if t > 0:
+                    s.add(Or(cur.S < zero.A - zero.L,
+                             *[times[tp].flows[f].A - times[tp].flows[f].L
+                               == cur.S
+                               for tp in range(t)]))
+                # Duh
+                s.add(cur.Ld <= cur.L)
+
+                # If S is too small, delay can stretch to -inf
+                s.add(Implies(cur.S < zero.A - zero.L,
+                              cur.rtt >= c.R + times[t].time - times[0].time))
+
+                # Set Ld and delay
+                for tp in range(0, t):
+                    pre = times[tp].flows[f]
+                    # if A-L does not change, we will pick the time corresponding
+                    # to the first one
+                    if tp > 0:
+                        not_subseq = (pre.A - pre.L != times[tp-1].flows[f].A
+                                      - times[tp-1].flows[f].L)
+                    else:
+                        not_subseq = True
+
+                    s.add(
+                        Implies(
+                            And(
+                                pre.A - pre.L == cur.S,
+                                not_subseq
+                            ),
+                            And(
+                                cur.Ld == pre.L,
+                                cur.rtt == c.R + times[t].time - times[tp].time
+                            )))
 
 if __name__ == "__main__":
     from plot import plot
@@ -168,11 +225,13 @@ if __name__ == "__main__":
     c = Config()
     c.unsat_core = True
     c.T = 10
+    c.inf_buf = False
     c.check()
     s = MySolver()
     v = ModelVariables(c, s)
 
-    s.add(v.times[-1].time >= 9)
+    s.add(v.times[-1].time >= 5)
+    s.add(v.times[3].flows[0].rtt == 1.5)
     for t in range(1, c.T):
         s.add(v.times[t].A >= v.times[t-1].A + c.C / 2)
 
