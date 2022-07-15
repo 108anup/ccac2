@@ -13,6 +13,11 @@ def plot(c: Config, v):
     fig, (ax1, ax2_rtt) = plt.subplots(2, 1)
     ax2_loss = ax2_rtt.twinx()
 
+    ax1.set_xlabel("Time")
+    ax2_rtt.set_xlabel("Time")
+    ax2_rtt.set_ylabel("RTT")
+    ax2_loss.set_ylabel("Loss")
+
     ax1.plot(times, ubound, marker='o', c='black', label='')
     ax1.plot(times + c.D, ubound, marker='o', c='black', label='')
     if not c.inf_buf:

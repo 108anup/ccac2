@@ -1,5 +1,5 @@
 from config import Config
-from pyz3_utils import MySolver, Variables
+from pyz3_utils import IfStmt, MySolver, Piecewise, Variables
 from z3 import And, Implies, Or, Sum
 
 
@@ -13,6 +13,10 @@ class Flow(Variables):
         self.L = s.Real(f"{name}_L")
         self.Ld = s.Real(f"{name}_Ld")
         self.rtt = s.Real(f"{name}_rtt")
+
+        # CCA
+        self.rate = s.Real(f"{name}_rate")
+        self.cwnd = s.Real(f"{name}_cwnd")
 
 
 class Timestep(Variables):
@@ -49,6 +53,17 @@ class ModelVariables(Variables):
 
         self.times = [Timestep(f"t{t}", c, s) for t in range(c.T)]
 
+        # Time gaps. It is discretized in the range 0 to c.D. Discretization
+        # helps with multiplication
+        breaks = [0, 0.25 * c.D, 0.5 * c.D, 0.75 * c.D, 1 * c.D]
+        self.delta_t = [None] + [
+            Piecewise.from_var(
+                self.times[t].time - self.times[t-1].time,
+                breaks,
+                [None] + breaks[1:] + [None],
+                s
+            ) for t in range(1, c.T)]
+
         if c.compose == False:
             # Upper bound on amount of data needed in queue for loss to occur
             self.epsilon = s.Real("epsilon")
@@ -64,6 +79,7 @@ class ModelVariables(Variables):
         self.initial()
         self.network()
         self.measure_losses_and_rtt()
+        self.cwnd_rate()
 
     def monotone(self):
         c = self.c
@@ -218,6 +234,51 @@ class ModelVariables(Variables):
                                 cur.rtt == c.R + times[t].time - times[tp].time
                             )))
 
+    def cwnd_rate(self):
+        c = self.c
+        s = self.s
+        times = self.times
+
+        for t in range(1, c.T):
+            # `A(t)` due to cwnd is `S(t-R) + Ld(t-R) + cwnd`. We need to
+            # ensure `t-R` exists
+
+            # Note: If c.D == c.R, the below constraint is identical to one we
+            # inserted in `network`. This is inefficient, but we'll let z3
+            # handle it in the interest of program clarity
+            s.add(Or(
+                times[t].time - times[0].time < c.R,
+                *[times[t].time - c.R == times[tp].time for tp in range(t)]
+            ))
+
+        for f in range(c.F):
+            for t in range(1, c.T):
+                pre = times[t-1].flows[f]
+                cur = times[t].flows[f]
+
+                # Calculate A due to rate
+                rate_A = pre.A + self.delta_t[t] * pre.rate
+
+                # Calculate A due to cwnd
+                cwnd_A = s.Real(f"cwnd_t{t}_f{f}")
+                for tp in range(t):
+                    # Note, no two `time`s are equal
+                    s.add(Implies(times[t].time - c.R == times[tp].time,
+                                  cwnd_A == times[tp].flows[f].S
+                                  + times[tp].flows[f].Ld + cur.cwnd))
+                # The most loose bound is when S(t) for t < 0 was always as
+                # high as S(0). Note: A is already constrained to be
+                # monotonic. test_A_L_monotone confirms that A-L is also
+                # implicitly monotonic
+                s.add(Implies(times[t].time - times[0].time < c.R,
+                              cwnd_A < times[0].flows[f].S +
+                              times[0].flows[f].Ld + cur.cwnd))
+
+                # Combine cwnd and rate to form A
+                s.add(cur.A <= cwnd_A)
+                s.add(Or(cur.A == rate_A, cur.A == pre.A))
+
+
 if __name__ == "__main__":
     from plot import plot
     from pyz3_utils import run_query
@@ -231,9 +292,9 @@ if __name__ == "__main__":
     v = ModelVariables(c, s)
 
     s.add(v.times[-1].time >= 5)
-    s.add(v.times[3].flows[0].rtt == 1.5)
-    for t in range(1, c.T):
-        s.add(v.times[t].A >= v.times[t-1].A + c.C / 2)
+    for t in range(c.T):
+        v.times[t].flows[0].cwnd = 1
+        v.times[t].flows[0].rate = 0.5
 
     res = run_query(c, s, v)
     print(res.satisfiable)
