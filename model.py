@@ -34,17 +34,6 @@ class Timestep(Variables):
         self.S = s.Real(f"{name}_S")
         self.L = s.Real(f"{name}_L")
 
-        self.total()
-
-    def total(self):
-        ''' Values of individual flows sum to the total '''
-        c = self.c
-        s = self.s
-
-        s.add(self.A == Sum([self.flows[f].A for f in range(c.F)]))
-        s.add(self.S == Sum([self.flows[f].S for f in range(c.F)]))
-        s.add(self.L == Sum([self.flows[f].L for f in range(c.F)]))
-
 
 class ModelVariables(Variables):
     def __init__(self, c: Config, s: MySolver):
@@ -67,216 +56,220 @@ class ModelVariables(Variables):
         if c.compose == False:
             # Upper bound on amount of data needed in queue for loss to occur
             self.epsilon = s.Real("epsilon")
-            s.add(self.epsilon >= 0)
 
         if not c.inf_buf:
             self.buf = s.Real("buf")
-            if c.buf_size is not None:
-                s.add(self.buf == c.buf_size)
-            s.add(self.buf > 0)
 
-        self.monotone()
-        self.initial()
-        self.network()
-        self.measure_losses_and_rtt()
-        self.cwnd_rate()
 
-    def monotone(self):
-        c = self.c
-        s = self.s
-        times = self.times
+def total(c: Config, s: MySolver, v: ModelVariables):
+    ''' Values of individual flows sum to the total '''
+    for time in v.times:
+        s.add(time.A == Sum([time.flows[f].A for f in range(c.F)]))
+        s.add(time.S == Sum([time.flows[f].S for f in range(c.F)]))
+        s.add(time.L == Sum([time.flows[f].L for f in range(c.F)]))
 
-        for t in range(1, c.T):
-            pre = times[t-1]
-            nex = times[t]
 
-            s.add(pre.W <= nex.W)
-            s.add(c.C * pre.time - pre.W <= c.C * nex.time - nex.W)
+def config_constraints(c: Config, s: MySolver, v: ModelVariables):
+    if c.compose == False:
+        # Upper bound on amount of data needed in queue for loss to occur
+        s.add(v.epsilon >= 0)
 
-            s.add(pre.time < nex.time)
+    if not c.inf_buf:
+        if c.buf_size is not None:
+            s.add(v.buf == c.buf_size)
+        s.add(v.buf > 0)
+
+
+def monotone(c: Config, s: MySolver, v: ModelVariables):
+    for t in range(1, c.T):
+        pre = v.times[t-1]
+        nex = v.times[t]
+
+        s.add(pre.W <= nex.W)
+        s.add(c.C * pre.time - pre.W <= c.C * nex.time - nex.W)
+
+        s.add(pre.time < nex.time)
+        s.add(pre.A <= nex.A)
+        s.add(pre.S <= nex.S)
+        s.add(pre.L <= nex.L)
+
+        for f in range(c.F):
+            pre = v.times[t-1].flows[f]
+            nex = v.times[t].flows[f]
+
             s.add(pre.A <= nex.A)
             s.add(pre.S <= nex.S)
             s.add(pre.L <= nex.L)
+            s.add(pre.Ld <= nex.Ld)
 
-            for f in range(c.F):
-                pre = times[t-1].flows[f]
-                nex = times[t].flows[f]
 
-                s.add(pre.A <= nex.A)
-                s.add(pre.S <= nex.S)
-                s.add(pre.L <= nex.L)
-                s.add(pre.Ld <= nex.Ld)
-
-    def initial(self):
+def initial(c: Config, s: MySolver, v: ModelVariables):
         ''' Set initial conditions '''
-        c = self.c
-        s = self.s
-        times = self.times
-
-        s.add(times[0].time == 0)
+        s.add(v.times[0].time == 0)
 
         # Since values are invariant to y-shift, we don't need to enfore
         # initial conditions. However we can always enforce one of them,
         # for pretty plots.
-        s.add(times[0].S == 0)
+        s.add(v.times[0].S == 0)
 
 
         for f in range(c.F):
-            init = times[0].flows[f]
+            init = v.times[0].flows[f]
             # What does negative loss even mean?
             s.add(init.L >= 0)
             s.add(init.Ld >= 0)
 
-    def network(self):
-        ''' The heart of the CCAC model '''
-        c = self.c
-        s = self.s
-        times = self.times
 
-        for t in range(c.T):
-            ts = self.times[t]
-            for f in range(c.F):
-                fl = ts.flows[f]
-                s.add(fl.S <= fl.A - fl.L)
-            s.add(ts.S <= c.C * ts.time - ts.W)
-
-            # Do things at time ts.time - c.D
-
-            # To begin with, if ts.time - c.D > 0, it should exist in the past
-            s.add(Or(ts.time < c.D,
-                *[times[pt].time == ts.time - c.D for pt in range(t)]))
-
-            # If ts.time - c.D < 0, then give maximum slack. This corresponds
-            # to no wastage when t < 0
-            s.add(c.C * (ts.time - c.D) - times[0].W <= ts.S)
-
-            for pt in range(t):
-                pts = self.times[t]
-                s.add(Implies(ts.time - c.D == pts.time,
-                              c.C * pts.time - pts.W <= ts.S))
-
-            if c.compose:
-                if t > 0:
-                    s.add(Implies(ts.W > times[t-1].W,
-                                  ts.A - ts.L <= c.C * ts.time - ts.W))
-            else:
-                if t > 0:
-                    s.add(Implies(ts.W > times[t-1].W,
-                                  ts.A - ts.L <= ts.S + self.epsilon))
-
-            if not c.inf_buf:
-                s.add(ts.A - ts.L <= c.C * ts.time - ts.W + self.buf)
-
-                if t == 0:
-                    continue
-                # We can make loss deterministic since we assume all curves are
-                # joined by straight lines. This does not lose generality since
-                # `times[t].time` is a variable. Thus Z3 can approximate any
-                # curve it likes with a piecewise linear curve (well...as long
-                # as it fits within c.T points)
-
-                s.add(Implies(ts.L > times[t-1].L,
-                              ts.A - ts.L ==
-                              c.C * ts.time - ts.W + self.buf))
-            else:
-                s.add(ts.L == times[0].L)
-
-    def measure_losses_and_rtt(self):
-        '''Constrain Ld based on A, S and L. If these constraints are added, it will
-        automatically calculate delay since for every t, it will force t' such
-        that A[t'] - L[t'] = S[t] if S[t] >= A[0]
-
-        '''
-        c = self.c
-        s = self.s
-        times = self.times
-
+def network(c: Config, s: MySolver, v: ModelVariables):
+    ''' The heart of the CCAC model '''
+    for t in range(c.T):
+        ts = v.times[t]
         for f in range(c.F):
-            s.add(times[0].flows[f].rtt > 0)
+            fl = ts.flows[f]
+            s.add(fl.S <= fl.A - fl.L)
+        s.add(ts.S <= c.C * ts.time - ts.W)
 
-        for t in range(0, c.T):
-            for f in range(c.F):
-                cur = times[t].flows[f]
-                zero = times[0].flows[f]
+        # Do things at time ts.time - c.D
 
-                # For every S, ensure a corresponding A exists
-                if t > 0:
-                    s.add(Or(cur.S < zero.A - zero.L,
-                             *[times[tp].flows[f].A - times[tp].flows[f].L
-                               == cur.S
-                               for tp in range(t)]))
-                # Duh
-                s.add(cur.Ld <= cur.L)
+        # To begin with, if ts.time - c.D > 0, it should exist in the past
+        s.add(Or(ts.time < c.D,
+            *[v.times[pt].time == ts.time - c.D for pt in range(t)]))
 
-                # If S is too small, delay can stretch to -inf
-                s.add(Implies(cur.S < zero.A - zero.L,
-                              cur.rtt >= c.R + times[t].time - times[0].time))
+        # If ts.time - c.D < 0, then give maximum slack. This corresponds
+        # to no wastage when t < 0
+        s.add(c.C * (ts.time - c.D) - v.times[0].W <= ts.S)
 
-                # Set Ld and delay
-                for tp in range(0, t):
-                    pre = times[tp].flows[f]
-                    # if A-L does not change, we will pick the time corresponding
-                    # to the first one
-                    if tp > 0:
-                        not_subseq = (pre.A - pre.L != times[tp-1].flows[f].A
-                                      - times[tp-1].flows[f].L)
-                    else:
-                        not_subseq = True
+        for pt in range(t):
+            pts = v.times[t]
+            s.add(Implies(ts.time - c.D == pts.time,
+                          c.C * pts.time - pts.W <= ts.S))
 
-                    s.add(
-                        Implies(
-                            And(
-                                pre.A - pre.L == cur.S,
-                                not_subseq
-                            ),
-                            And(
-                                cur.Ld == pre.L,
-                                cur.rtt == c.R + times[t].time - times[tp].time
-                            )))
+        if c.compose:
+            if t > 0:
+                s.add(Implies(ts.W > v.times[t-1].W,
+                              ts.A - ts.L <= c.C * ts.time - ts.W))
+        else:
+            if t > 0:
+                s.add(Implies(ts.W > v.times[t-1].W,
+                              ts.A - ts.L <= ts.S + v.epsilon))
 
-    def cwnd_rate(self):
-        c = self.c
-        s = self.s
-        times = self.times
+        if not c.inf_buf:
+            s.add(ts.A - ts.L <= c.C * ts.time - ts.W + v.buf)
 
+            if t == 0:
+                continue
+            # We can make loss deterministic since we assume all curves are
+            # joined by straight lines. This does not lose generality since
+            # `times[t].time` is a variable. Thus Z3 can approximate any
+            # curve it likes with a piecewise linear curve (well...as long
+            # as it fits within c.T points)
+
+            s.add(Implies(ts.L > v.times[t-1].L,
+                          ts.A - ts.L ==
+                          c.C * ts.time - ts.W + v.buf))
+        else:
+            s.add(ts.L == v.times[0].L)
+
+
+def measure_losses_and_rtt(c: Config, s: MySolver, v: ModelVariables):
+    '''Constrain Ld based on A, S and L. If these constraints are added, it will
+    automatically calculate delay since for every t, it will force t' such
+    that A[t'] - L[t'] = S[t] if S[t] >= A[0]
+
+    '''
+    for f in range(c.F):
+        s.add(v.times[0].flows[f].rtt > 0)
+
+    for t in range(0, c.T):
+        for f in range(c.F):
+            cur = v.times[t].flows[f]
+            zero = v.times[0].flows[f]
+
+            # For every S, ensure a corresponding A exists
+            if t > 0:
+                s.add(Or(cur.S < zero.A - zero.L,
+                         *[v.times[tp].flows[f].A - v.times[tp].flows[f].L
+                           == cur.S
+                           for tp in range(t)]))
+            # Duh
+            s.add(cur.Ld <= cur.L)
+
+            # If S is too small, delay can stretch to -inf
+            s.add(Implies(cur.S < zero.A - zero.L,
+                          cur.rtt >= c.R + v.times[t].time - v.times[0].time))
+
+            # Set Ld and delay
+            for tp in range(0, t):
+                pre = v.times[tp].flows[f]
+                # if A-L does not change, we will pick the time corresponding
+                # to the first one
+                if tp > 0:
+                    not_subseq = (pre.A - pre.L != v.times[tp-1].flows[f].A
+                                  - v.times[tp-1].flows[f].L)
+                else:
+                    not_subseq = True
+
+                s.add(
+                    Implies(
+                        And(
+                            pre.A - pre.L == cur.S,
+                            not_subseq
+                        ),
+                        And(
+                            cur.Ld == pre.L,
+                            cur.rtt == c.R + v.times[t].time - v.times[tp].time
+                        )))
+
+
+def cwnd_rate(c: Config, s: MySolver, v: ModelVariables):
+    for t in range(1, c.T):
+        # `A(t)` due to cwnd is `S(t-R) + Ld(t-R) + cwnd`. We need to
+        # ensure `t-R` exists
+
+        # Note: If c.D == c.R, the below constraint is identical to one we
+        # inserted in `network`. This is inefficient, but we'll let z3
+        # handle it in the interest of program clarity
+        s.add(Or(
+            v.times[t].time - v.times[0].time < c.R,
+            *[v.times[t].time - c.R == v.times[tp].time for tp in range(t)]
+        ))
+
+    for f in range(c.F):
         for t in range(1, c.T):
-            # `A(t)` due to cwnd is `S(t-R) + Ld(t-R) + cwnd`. We need to
-            # ensure `t-R` exists
+            pre = v.times[t-1].flows[f]
+            cur = v.times[t].flows[f]
 
-            # Note: If c.D == c.R, the below constraint is identical to one we
-            # inserted in `network`. This is inefficient, but we'll let z3
-            # handle it in the interest of program clarity
-            s.add(Or(
-                times[t].time - times[0].time < c.R,
-                *[times[t].time - c.R == times[tp].time for tp in range(t)]
-            ))
+            # Calculate A due to rate
+            rate_A = pre.A + v.delta_t[t] * pre.rate
 
-        for f in range(c.F):
-            for t in range(1, c.T):
-                pre = times[t-1].flows[f]
-                cur = times[t].flows[f]
+            # Calculate A due to cwnd
+            cwnd_A = s.Real(f"cwnd_t{t}_f{f}")
+            for tp in range(t):
+                # Note, no two `time`s are equal
+                s.add(Implies(v.times[t].time - c.R == v.times[tp].time,
+                              cwnd_A == v.times[tp].flows[f].S
+                              + v.times[tp].flows[f].Ld + cur.cwnd))
+            # The most loose bound is when S(t) for t < 0 was always as
+            # high as S(0). Note: A is already constrained to be
+            # monotonic. test_A_L_monotone confirms that A-L is also
+            # implicitly monotonic
+            s.add(Implies(v.times[t].time - v.times[0].time < c.R,
+                          cwnd_A < v.times[0].flows[f].S +
+                          v.times[0].flows[f].Ld + cur.cwnd))
 
-                # Calculate A due to rate
-                rate_A = pre.A + self.delta_t[t] * pre.rate
+            # Combine cwnd and rate to form A
+            s.add(cur.A <= cwnd_A)
+            s.add(Or(cur.A == rate_A, cur.A == pre.A))
 
-                # Calculate A due to cwnd
-                cwnd_A = s.Real(f"cwnd_t{t}_f{f}")
-                for tp in range(t):
-                    # Note, no two `time`s are equal
-                    s.add(Implies(times[t].time - c.R == times[tp].time,
-                                  cwnd_A == times[tp].flows[f].S
-                                  + times[tp].flows[f].Ld + cur.cwnd))
-                # The most loose bound is when S(t) for t < 0 was always as
-                # high as S(0). Note: A is already constrained to be
-                # monotonic. test_A_L_monotone confirms that A-L is also
-                # implicitly monotonic
-                s.add(Implies(times[t].time - times[0].time < c.R,
-                              cwnd_A < times[0].flows[f].S +
-                              times[0].flows[f].Ld + cur.cwnd))
 
-                # Combine cwnd and rate to form A
-                s.add(cur.A <= cwnd_A)
-                s.add(Or(cur.A == rate_A, cur.A == pre.A))
+def all_constraints(c: Config, s: MySolver, v: ModelVariables):
+    total(c, s, v)
+    config_constraints(c, s, v)
+    monotone(c, s, v)
+    initial(c, s, v)
+    network(c, s, v)
+    measure_losses_and_rtt(c, s, v)
+    cwnd_rate(c, s, v)
 
 
 if __name__ == "__main__":
@@ -290,6 +283,7 @@ if __name__ == "__main__":
     c.check()
     s = MySolver()
     v = ModelVariables(c, s)
+    all_constraints(c, s, v)
 
     s.add(v.times[-1].time >= 5)
     for t in range(c.T):
