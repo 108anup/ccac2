@@ -262,6 +262,44 @@ def cwnd_rate(c: Config, s: MySolver, v: ModelVariables):
             s.add(Or(cur.A == rate_A, cur.A == pre.A))
 
 
+def multi_flow(c: Config, s: MySolver, v: ModelVariables):
+    '''Make sure that the quantities for individual flows are consistent with
+    having a FIFO queue
+
+    '''
+    for t in range(1, c.T):
+        ts = v.times[t]
+        tz = v.times[0]
+        # Make sure if we draw a horizontal line backward from S(t), it
+        # intersects at a point t' on A(t') - L(t') = S(t). Formally ∀t ∈ ℕ,
+        # ((t ≥ 1 ∧ S[t] ≥ A[0] - L[0]) ⇒ (∃t' ∈ ℕ, S[t] = A[t'] - L[t']))
+        s.add(Implies(
+            ts.S >= tz.A - tz.L,
+            Or(*[ts.S == v.times[tp].A - v.times[tp].L for tp in range(t)])
+        ))
+
+        # If S[t] < A[0] - L[0], we do not place any restrictions on flow-level
+        # S since the packets could have historicaly been enqueued in any way
+        # for t < 0
+
+        # Otherwise, let's ensure that for the t' above, for flow f, S_f[t] =
+        # A_f[t'] - L[t']. This happens because packets across flows that were
+        # enqueued together are dequeued together. If we sum the equality over
+        # all flows, f, we will recover (∑_f S_f[t]) = S[t] = A[t'] - L[t'] =
+        # (∑_f A_f[t] - L_f[t])
+        for tp in range(t):
+            tsp = v.times[tp]
+            s.add(Implies(
+                And(ts.S == tsp.A - tsp.L,
+                    ts.S >= tz.A - tz.L # This clause is unnecessary, but can
+                                        # make search faster by letting z3
+                                        # eliminate branches earlier
+                    ),
+                And(*[ts.flows[f].S == tsp.flows[f].A - tsp.flows[f].L
+                      for f in range(c.F)])
+            ))
+
+
 def all_constraints(c: Config, s: MySolver, v: ModelVariables):
     total(c, s, v)
     config_constraints(c, s, v)
@@ -270,6 +308,8 @@ def all_constraints(c: Config, s: MySolver, v: ModelVariables):
     network(c, s, v)
     measure_losses_and_rtt(c, s, v)
     cwnd_rate(c, s, v)
+    if c.F > 1:
+        multi_flow(c, s, v)
 
 
 if __name__ == "__main__":
@@ -277,8 +317,9 @@ if __name__ == "__main__":
     from pyz3_utils import run_query
 
     c = Config()
-    c.unsat_core = True
+    c.unsat_core = False
     c.T = 10
+    c.F = 2
     c.inf_buf = False
     c.check()
     s = MySolver()
