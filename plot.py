@@ -1,6 +1,8 @@
-from config import Config
 import matplotlib.pyplot as plt
 import numpy as np
+
+from .config import Config
+
 
 def plot(c: Config, v):
     linestyles = ['-', '--', '-.', ':']

@@ -1,5 +1,6 @@
 from typing import Optional
 
+
 class Config:
     C: float = 1
     R: float = 1
@@ -19,7 +20,7 @@ class Config:
         if self.T <= 1 or self.F < 1:
             return False
 
-        if self.inf_buf == True and self.buf_size is not None:
+        if self.inf_buf and self.buf_size is not None:
             return False
         if self.buf_size is not None and self.buf_size <= 0:
             return False

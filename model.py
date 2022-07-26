@@ -1,6 +1,7 @@
-from config import Config
 from pyz3_utils import IfStmt, MySolver, Piecewise, Variables
 from z3 import And, Implies, Or, Sum
+
+from .config import Config
 
 
 class Flow(Variables):
@@ -313,8 +314,9 @@ def all_constraints(c: Config, s: MySolver, v: ModelVariables):
 
 
 if __name__ == "__main__":
-    from plot import plot
     from pyz3_utils import run_query
+
+    from plot import plot
 
     c = Config()
     c.unsat_core = False

@@ -1,8 +1,11 @@
-from config import Config
-from model import ModelVariables
-from pyz3_utils import MySolver, Piecewise, run_query
 import unittest
+
+from pyz3_utils import MySolver, Piecewise, run_query
 from z3 import Or
+
+from .config import Config
+from .model import ModelVariables
+
 
 class TestModel(unittest.TestCase):
     def test_max_delta_t(self):
